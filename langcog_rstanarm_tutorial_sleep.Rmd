@@ -1,7 +1,9 @@
 ---
 title: "LangCog RStanArm Tutorial"
-output: html_notebook
-editor_options: 
+output:
+  html_document: default
+  html_notebook: default
+editor_options:
   chunk_output_type: inline
 ---
 
@@ -31,7 +33,7 @@ Clear the workspace and set some global options for the notebook.
 
 ```{r}
 rm(list=ls())
-knitr::opts_chunk$set(echo=F, warning=F, cache=T, message=F)
+knitr::opts_chunk$set(echo=T, warning=F, cache=T, message=F)
 ```
 
 Load packages and set plotting aesthetics. 
