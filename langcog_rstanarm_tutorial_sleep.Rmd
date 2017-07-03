@@ -1,0 +1,450 @@
+---
+title: "LangCog RStanArm Tutorial"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Preamble
+
+The goal of this notebook is to bring together resources on the *rstanarm* R package, which provides an interface between the R programming environment and the Stan probabilistic programming language. 
+
+The creators of *rstanarm* say the goal of the package is to,
+
+> make Bayesian estimation routine for the most common regression models that applied researchers use. This will enable researchers to avoid the counter-intuitiveness of the frequentist approach to probability and statistics with only minimal changes to their existing R scripts.
+
+If you are already fitting models using lm() or glm() form the *stats* package or using the mixed effects versions lmer() and glmer() from *lme4*, then it will be easy to translate those models to a Bayesian framework to get the Bayesian benefits. To do so, you:
+
+* add `stan_` to your models
+* specify a prior distribution (or use the default, weakly informative priors)
+* learn how to "inspect" the posterior distribution and report the results
+
+A great place to get started is the CRAN *rstanarm* [page](https://cran.r-project.org/web/packages/rstanarm/index.html), which has a ton of helpful vignettes. This document is my attempt to pull together pieces of information that I found helpful. In it, we will:
+
+  * Fit different kinds of linear models to a simulated dataset: MLE, LMM, and Bayesian LMM
+  * Learn how to extract posterior samples from a fitted model object 
+  * See a set of tools for visualizing distributions (both priors and posteriors) in a Bayesian analysis
+
+## Set up 
+
+Clear the workspace and set some global options for the notebook.
+
+```{r}
+rm(list=ls())
+knitr::opts_chunk$set(echo=F, warning=F, cache=T, message=F)
+```
+
+Load packages and set plotting aesthetics. 
+
+```{r}
+library(rstanarm)
+library(lme4)
+library(tidyverse)
+library(broom)
+library(magrittr)
+theme_set(ggthemes::theme_few())
+```
+
+A lot of the code in this tutorial is inspired by a [blogpost](https://tjmahr.github.io/plotting-partial-pooling-in-mixed-effects-models/) from Tristan Mahr where he models the effect of sleep deprivation on Reaction Time using the `sleepstudy` dataset. The post is great! And it's a really nice example of how to use visualization to understand what's going on in a data analysis model. 
+
+Here is some backgound information on the dataset:
+
+> The average reaction time per day for subjects in a sleep deprivation study. On day 0 the subjects had their normal amount of sleep. Starting that night they were restricted to 3 hours of sleep per night. The observations represent the average reaction time on a series of tests given each day to each subject.
+
+Load the data and look at the structure.
+
+```{r}
+d.orig <- sleepstudy
+glimpse(d.orig)
+```
+
+Let's get a sense of the variability due to random effects by plotting the relationship between days of sleep deprivation and Reaction Time for each participant. 
+
+```{r}
+xlab <- "Days of sleep deprivation"
+ylab <- "Average reaction time (ms)"
+
+ggplot(d.orig) + 
+  aes(x = Days, y = Reaction) + 
+  stat_smooth(method = "lm", se = FALSE) +
+  geom_point() +
+  facet_wrap("Subject") +
+  labs(x = xlab, y = ylab) + 
+  scale_x_continuous(breaks = 0:4 * 2)
+```
+
+We can also summarize these data in table by computing the mean and standard deviation for each day. These summary statistics will also be used as parameters in our simulated dataset. 
+
+```{r}
+ms <- d.orig %>% 
+  group_by(Days) %>% 
+  summarise(m = mean(Reaction),
+            stdev = sd(Reaction)) %>% 
+  mutate_all(round, digits = 2) %>% 
+  mutate(Days = as.character(Days))
+
+ms %>% knitr::kable()
+```
+
+## Simulation
+
+To help us understand the models in the RStanArm package, let's write a few functions to simulate these data. Note the repeated measures structure: that we have multiple measures for each participant that come from different days. Participants could vary in their baseline RTs and they could also vary in how they respond to sleep deprivation, so we want to build this into our simulation.
+
+
+```{r}
+simulate_participant <- function(days_deprivation, ss_noise = 0, id, location_shift = 0) {
+  day_tibble <- tibble()
+  ss_tibble <- tibble()
+  # simulate taking measurements for a range of days
+  for (day in days_deprivation) {
+    day_noise <- rnorm(1, mean = 0, sd = abs(ss_noise)) # randomly sample the noise
+    RT <- simulate_measurement(params_df = ms, day = quo(day), ss_noise = day_noise,
+                               location_shift = location_shift)
+    day_tibble <- tibble(id, day, RT, day_noise, ss_noise)
+    ss_tibble <- bind_rows(ss_tibble, day_tibble)
+  }
+  ss_tibble
+}
+```
+
+Next, let's write a function to generate model parameters for each participant. Note that the user can control: 
+
+  * the amount of participant-level variability using the `ss_noise` argument, which controls the width of the noise distribution. higher numbers result in more noise for each participant's measurement.
+  * the size of the effect of sleep deprivation using the `location_shift` argument. higher numbers result in a smaller effect of day
+
+```{r}
+simulate_measurement <- function (params_df, day, ss_noise = 0, location_shift = 0) {
+  # extract the underlying paramters for that day 
+  # note the use of !! from the tidyeval framework, allows us to pass variables to dplyr verbs
+  params <- params_df %>% filter(Days == !!day) 
+  m <- params %>% mutate(m_shift = m - (as.numeric(Days) * location_shift)) %>% pull(m_shift)
+  s <- params %>% pull(stdev) + ss_noise
+  # convert to log space for the log-normal distribution
+  location <- log(m^2 / sqrt(s^2 + m^2))
+  shape <- sqrt(log(1 + (s^2 / m^2)))
+  # sample an RT from the log-normal distribution
+  ss_rt <- rlnorm(n = 1, mean = location, sd = shape)
+  # make sure RT is positive and above 100 ms
+  if (ss_rt < 200) {ss_rt <- 200}
+  ss_rt
+}
+
+```
+
+Test our simulate_participant() function with no added noise and the same age effect as in the original dataset. 
+
+```{r}
+days_deprivation <- min(d.orig$Days):max(d.orig$Days)
+simulate_participant(days_deprivation = days_deprivation, ss_noise = 0, id = 1, 
+                     location_shift = 0) %>% 
+  mutate(orig_RT = ms$m)
+```
+
+Now that we can simulate the data for a single participant, let's simulate the entire experiment.
+
+```{r}
+# global vars
+n_participants <- 20 # controls the number of participants in the study
+ss_noise_experiment <- 100 # controls the amount of noise for each participant, higher numbers mean noisier participants
+location_shift <- 0 # controls whether there is an effect of day, higher numbers decrease the effect of sleep deprivation on RT
+
+# run simulation
+d <- tibble()
+
+for (id in 1:n_participants) {
+  ss_noise <- rnorm(n = 1, mean = 0, sd = ss_noise_experiment)
+  ss <- simulate_participant(days_deprivation, ss_noise = ss_noise_experiment, id = id, 
+                             location_shift = location_shift)
+  d <- bind_rows(d, ss)
+}
+```
+
+Plot the simulated data by participant with regression lines fit to each participants' data.
+
+```{r}
+sleep_plot <- ggplot(d) + 
+  aes(x = day, y = RT) + 
+  stat_smooth(method = "lm", se = FALSE) +
+  geom_point() +
+  facet_wrap("id", scales ="free") +
+  labs(x = xlab, y = ylab) + 
+  scale_x_continuous(breaks = 0:4 * 2) 
+
+sleep_plot
+```
+
+Fit a complete pooling that doesn't know that our measurements come from different participants. 
+
+```{r}
+m_pooled <- lm(RT ~ day, d) 
+summary(m_pooled)
+
+df_pooled <- data_frame(
+  Model = "Complete pooling",
+  id = as.character(unique(d$id)),
+  intercept = coef(m_pooled)[1], 
+  slope_days = coef(m_pooled)[2])
+```
+
+## Visualize variability by participant
+
+```{r}
+d %>% 
+  group_by(id) %>% 
+  summarise(m_rt = mean(RT)) %>% 
+  mutate(id = reorder(id, m_rt)) %>% 
+  ggplot(aes(x = id, y = m_rt)) +
+  geom_hline(yintercept = mean(d$RT), linetype = "dashed") +
+  geom_point(color = "darkorange", size = 2) +
+  coord_flip() +
+  lims(y = c(0, 750))
+```
+
+
+Fit mixed effect model allowing for each participant to have a different intercept and slope.
+
+```{r}
+m_mixed <- lmer(RT ~ 1 + day + (1 + day | id), data = d)
+summary(m_mixed)
+```
+
+We can plot the model outpout for each participant alongside their data.
+
+```{r}
+# extract random effect coefs for each participant
+df_partial_pooling <- coef(m_mixed)[["id"]] %>% 
+  as_tibble() %>% 
+  rownames_to_column("id") %>% 
+  rename(intercept = `(Intercept)`, slope_days = day) %>% 
+  mutate(Model = "Partial pooling")
+
+
+# Add this information to the data plot
+d %<>% mutate(id = as.character(id)) 
+df_models <- left_join(d, df_partial_pooling, by = "id") 
+df_models %<>% bind_rows(., df_pooled)
+
+# Make plot
+p_model_comparison <- ggplot(df_models) + 
+  aes(x = day, y = RT) + 
+  geom_abline(aes(intercept = intercept, slope = slope_days, color = Model),
+              size = .75) + 
+  geom_point() +
+  facet_wrap("id", scales = "free") +
+  scale_x_continuous(breaks = 0:4 * 2) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme(legend.position = "top")
+
+p_model_comparison
+```
+
+It looks like when we increase the level of noise for each participant, or between-participants variability, we get different inferences from lm vs. lmer(). In the complete pooling model the slope parameter is sig, but in the mixed-effects model it is not. 
+
+## Fit Bayesian Mixed Effects model using RStanArm
+
+Set the number of cores to the number of cores on your computer.
+
+```{r}
+options(mc.cores = parallel::detectCores())
+```
+
+Fit the varying intercepts and slopes model.
+
+```{r}
+m_bglmer <- stan_glmer(
+  RT ~ day + (day | id), # specify model formula the same way as in glmer 
+  family = gaussian(), # specify type of model
+  data = d,
+  prior = normal(0, 2), # prior on model coefs (Does not include coefficients that vary by group in a multilevel model)
+  prior_intercept = normal(0, 5), # prior on intercept after centering predictors
+  prior_covariance = decov(regularization = 2), # prior on Covariance matrices for mixed effects model
+  chains = 2
+)
+```
+
+We can use the default plot function in R directly on our fitted model to visualize the posterior interval over various parameters in the model. 
+
+```{r}
+# all parameters including random slopes and intercepts
+plot(m_bglmer)
+
+# zoom in on just the slope parameter
+plot(m_bglmer, pars = c("day"))
+```
+
+Under the hood, the plot method is using functions from the `bayesplot` library. There are a lot of other visualizations of the posterior distributions that you can make using this library, and the nice thing is that all of the functions return ggplot objects! 
+
+For more information on what you can do with the `bayesplot` library, see the [manual](https://cran.r-project.org/web/packages/bayesplot/bayesplot.pdf) and this nice [vignette](https://cran.r-project.org/web/packages/bayesplot/vignettes/MCMC.html).
+
+```{r}
+library(bayesplot)
+posterior <- m_bglmer %>% as.data.frame() # extract the posterior samples as data frame
+color_scheme_set("gray") # set color aesthetics of plot
+
+# make a bivariate scatter of the intercept and slope parameters
+mcmc_scatter(posterior, pars = c("(Intercept)", "day"), size = 1.5, alpha = 0.5) 
+```
+
+We can also create the same interval plot from before. 
+
+```{r}
+color_scheme_set("red")
+
+p <- posterior %>% 
+  # just plot the slope parameter
+  select(starts_with("day")) %>%
+  mcmc_intervals(.,
+                 prob = 0.8, # 80% intervals
+                 prob_outer = 0.99, # 99%
+                 point_est = "mean"
+                 ) 
+p
+
+# add a vline at zero
+p + xlim(-5,25) +
+  geom_vline(xintercept = 0, linetype = 'dashed')
+```
+
+Or if you want to make a density plot. 
+
+```{r}
+posterior %>% 
+  select(contains("day")) %>% 
+  mcmc_areas(., 
+             pars = c("day"),
+             prob = 0.8, # 80% interval
+             prob_outer = 0.99, # 99% interval
+             point_est = "mean"
+)
+```
+
+The bayesplot and default plots are nice, but if you want more flexibility, you can sample from samples from the posterior distributions over the slope and intercept parameters. This first visualization is a countour plot using code from Tristan Mahr's lovely [blogpost](https://tjmahr.github.io/plotting-partial-pooling-in-mixed-effects-models/). 
+
+Let's first extract the samples from the model obect.
+
+```{r}
+# Get a dataframe: One row per posterior sample
+df_posterior <- m_bglmer %>% 
+  as.data.frame() %>% 
+  as_tibble() %>% 
+  rename(intercept = `(Intercept)`)
+```
+
+Now make the contour plot, showing a set of plausible values for the intercept and slope parameters.
+
+```{r}
+ggplot(df_posterior) + 
+  aes(x = intercept, y = `day`) + 
+  # Calculate the density
+  stat_density_2d(aes(fill = ..level..), geom = "polygon") +
+  ggtitle("Where's the average intercept and slope?") + 
+  xlab("Estimate for average intercept") + 
+  ylab("Estimate for average slope") +
+  # Use the same coordinate limits as last plot
+  coord_cartesian(
+    xlim = range(df_posterior$intercept), 
+    ylim = range(df_posterior$day),
+    expand = TRUE) + 
+  guides(fill = "none")
+```
+
+## Diagnostics and plots using Shiny Stan
+
+```{r, eval = F}
+launch_shinystan(m_bglmer)
+```
+
+A few things to look at in Shiny Stan:
+
+* traceplots of MCMC chains
+* Posterior predictive (PP) checks
+  - distribution of observed data vs model-generated data
+  - distributions of test statistics
+* generating tables
+
+## Inspecting Priors
+
+It's always a good idea to check the prior distribution over the parameters in your model to see what kinds of values are generated and confirm that our prior information produces sensible model behavior.
+
+We can use the prior_summary() function to get information about the priors and adjustments used in the model.
+
+```{r}
+prior_summary(m_bglmer)
+```
+
+*rstanarm* comes with a built-in function for visualizing "belief change" after seeing the data.
+
+```{r}
+posterior_vs_prior(m_bglmer, pars = "day")
+```
+
+But we can also sample from the prior directly using: `prior_PD = TRUE`. 
+
+```{r}
+m_bglmer_prior <- stan_glmer(
+  RT ~ day + (day | id),
+  family = gaussian(),
+  data = d,
+  prior = normal(0, 2),
+  prior_intercept = normal(0, 5),
+  prior_covariance = decov(regularization = 2),
+  prior_aux = cauchy(0, 1),
+  chains = 2,
+  prior_PD = TRUE # set this to TRUE to sample directly from prior
+)
+```
+
+```{r}
+summary(m_bglmer_prior, pars = c("(Intercept)", "day"), probs = c(.1, .5, .9))
+
+sd <- broom::tidy(m_bglmer_prior) %>% pull(std.error)
+sd <- sd[2] 
+```
+
+We can see that our initial prior of `normal(0, 2)` for the effect of sleep deprivation is centered around zero and thinks that an increase of +/- `r round(sd, 2)` milliseconds per day is reasonable. This seems sensible to me, but if you had more information about what you expect the range of effects to be, you could build this into the prior. 
+
+Let's simulate the same model with a "wider" prior.
+
+```{r}
+m_bglmer_prior_wide <- stan_glmer(
+  RT ~ day + (day | id),
+  family = gaussian(),
+  data = d,
+  prior = normal(0, 10), # change the prior on the slope parameter
+  prior_intercept = normal(0, 5),
+  prior_covariance = decov(regularization = 2),
+  prior_aux = cauchy(0, 1),
+  chains = 2,
+  prior_PD = TRUE
+)
+
+summary(m_bglmer_prior_wide, pars = c("(Intercept)", "day"), probs = c(.1, .5, .9))
+```
+
+Now we can see that the model considers values +/- 150 ms per day to be reasonable (within 1 sd), which is probably too broad. 
+
+A note on priors from the developers of *rstanarm* (priors [vignette](https://cran.r-project.org/web/packages/rstanarm/vignettes/priors.html)):
+
+> With very few exceptions, the default priors in rstanarm —the priors used if the arguments in the tables above are untouched— are not flat priors. Rather, the defaults are intended to be weakly informative. That is, they are designed to provide moderate regularization and help stabilize computation. For many (if not most) applications the defaults will perform well, but this is not guaranteed (there are no default priors that make sense for every possible model specification).
+
+> Because the scaling is based on the scales of the predictors (and possibly the outcome) these are technically data-dependent priors. However, since these priors are quite wide (and in most cases rather conservative), the amount of information used is weak and mainly takes into account the order of magnitude of the variables. This enables rstanarm to offer defaults that are reasonable for many models.
+
+To disable automatic rescaling simply set the autoscale argument to to FALSE. For example:
+
+```{r}
+test_no_autoscale <-
+  update(
+    m_bglmer_prior,
+    prior = normal(0, 5, autoscale = FALSE),
+    prior_intercept = student_t(4, 0, 10, autoscale = FALSE),
+    prior_aux = exponential(1/10, autoscale=FALSE)
+  )
+```
+
+```{r}
+prior_summary(test_no_autoscale)
+```
+
+But the rstanarm developers point out that:
+
+> Disabling prior scale adjustments is usually unnecessary but is useful for when more informative prior information is available. There is an example of specifying an informative prior later in this vignette.
